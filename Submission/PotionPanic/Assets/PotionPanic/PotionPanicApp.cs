@@ -25,7 +25,30 @@ namespace PotionPanic
         RectTransform board, page;
         PotionHoldButton pourButton, stirButton;
         AudioSource speaker;
+        PotionMusic music;
         AudioClip chime;
+        PotionMusicLibrary sounds;
+        readonly HashSet<Order> announcedCustomers = new HashSet<Order>();
+        readonly HashSet<Order> announcedBrews = new HashSet<Order>();
+        readonly Dictionary<string, int> soundCounts = new Dictionary<string, int>();
+        void PlayEffect(AudioClip clip)
+        {
+            if (clip == null) return;
+            speaker.PlayOneShot(clip);
+            soundCounts[clip.name] = EffectCount(clip.name) + 1;
+        }
+        int EffectCount(string name) => soundCounts.TryGetValue(name, out int count) ? count : 0;
+        void CheckOrderSounds()
+        {
+            if (sounds == null) return;
+            // Watch every ticket, even when the player is working at another station.
+            foreach (Order order in game.Orders)
+            {
+                if (announcedCustomers.Add(order)) PlayEffect(sounds.newCustomer);
+                if (order.BrewTime >= PotionGame.BrewStart && announcedBrews.Add(order))
+                    PlayEffect(sounds.brewReady);
+            }
+        }
         Text messageText;
         float messageUntil;
         string lastMessage = "";
@@ -42,14 +65,19 @@ namespace PotionPanic
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
         static void Boot()
         {
-            // FindObjectOfType also works in the required Unity 2022.1 editor.
+            // Use the newer lookup in Unity 6, while keeping Unity 2022.1 compatibility.
+#if UNITY_2023_1_OR_NEWER
+            if (FindFirstObjectByType<PotionPanicApp>() == null) new GameObject("Potion Panic Game").AddComponent<PotionPanicApp>();
+#else
             if (FindObjectOfType<PotionPanicApp>() == null) new GameObject("Potion Panic Game").AddComponent<PotionPanicApp>();
+#endif
         }
         void Start()
         {
             Application.targetFrameRate = 60;
             SetupCanvas(); SetupAudio();
             AudioListener.volume = Mathf.Clamp01(PlayerPrefs.GetFloat("Potion.Volume", .7f));
+            music = gameObject.AddComponent<PotionMusic>();
             resolutionIndex = Mathf.Clamp(PlayerPrefs.GetInt("Potion.Resolution",1),0,sizes.Length-1);
             fullScreen = PlayerPrefs.GetInt("Potion.Fullscreen",0) == 1;
             if (PlayerPrefs.HasKey("Potion.Resolution")) ApplyDisplay();
@@ -90,11 +118,17 @@ namespace PotionPanic
         void SetupAudio()
         {
             speaker = gameObject.AddComponent<AudioSource>();
+            speaker.playOnAwake = false;
+            sounds = Resources.Load<PotionMusicLibrary>("PotionMusic");
             chime = AudioClip.Create("Potion chime",11025,1,44100,false);
             var samples = new float[11025];
             for(int i=0;i<samples.Length;i++) samples[i]=Mathf.Sin(i*2*Mathf.PI*660/44100)*.2f*(1-i/(float)samples.Length);
             chime.SetData(samples,0);
+#if UNITY_2023_1_OR_NEWER
+            if (FindFirstObjectByType<AudioListener>() == null) gameObject.AddComponent<AudioListener>();
+#else
             if (FindObjectOfType<AudioListener>() == null) gameObject.AddComponent<AudioListener>();
+#endif
         }
         void OnDestroy()
         {
@@ -122,6 +156,7 @@ namespace PotionPanic
                 int count = game.Orders.Count;
                 Phase before = selected == null ? Phase.Waiting : selected.Phase;
                 game.Tick(Time.deltaTime);
+                CheckOrderSounds();
                 if (pourButton != null && pourButton.Held) game.Pour(selected,ingredient,Time.deltaTime);
                 if (stirButton != null && stirButton.Held) game.Stir(selected,Time.deltaTime);
                 if (game.Complete) Go(Menu.Results);
@@ -134,6 +169,8 @@ namespace PotionPanic
         {
             game = new PotionGame(practice,daySeconds[difficulty],arrivalSeconds[arrivalChoice]);
             selected = null; ingredient = matchingTicket = 0; lastMessage = "";
+            announcedCustomers.Clear(); announcedBrews.Clear();
+            CheckOrderSounds();
             Go(Menu.Orders);
         }
         void Go(Menu next) { menu = next; Render(); }
@@ -159,7 +196,8 @@ namespace PotionPanic
         }
         Button ActionButton(string text,float x,float y,float w,Action action,bool accent=false,Func<bool> allowed=null)
         {
-            var button=Button(page,text,x,y,w,52,()=>{ action(); },accent);
+            // Hold controls use pointer events and intentionally have no click action.
+            var button=Button(page,text,x,y,w,52,()=>{ action?.Invoke(); },accent);
             if(allowed!=null) live.Add(()=>button.interactable=allowed());
             return button;
         }
@@ -167,6 +205,10 @@ namespace PotionPanic
         void Render()
         {
             if(board==null) return;
+            // Forest keeps playing in pause/options during a shift. Pre-game menus use the jazz track.
+            bool shiftMusic = Playing || menu == Menu.Pause || (menu == Menu.Options &&
+                (returnFromOptions == Menu.Pause || (returnFromOptions >= Menu.Orders && returnFromOptions <= Menu.Finishing)));
+            if(music!=null) music.Play(menu == Menu.Results ? PotionMusic.Cue.Results : shiftMusic ? PotionMusic.Cue.Gameplay : PotionMusic.Cue.MainMenu);
             if(page!=null) page.gameObject.SetActive(false);
             live.Clear(); pourButton=stirButton=null; messageText=null;
             page=menus[menu];
@@ -209,6 +251,8 @@ namespace PotionPanic
             {
                 for(int i=0;i<5;i++) Bottle(page,849+i*87,177+row*154,.7f,(i+row)%2,Liquids[(i+row)%3]);
                 Panel(page,"Wooden shelf",832,282+row*154,476,16,C("79584D"));
+                Panel(page,"Left shelf bracket",847,298+row*154,18,15,C("4B393B"));
+                Panel(page,"Right shelf bracket",1275,298+row*154,18,15,C("4B393B"));
             }
             Cauldron(page,927,474,Liquids[1]);
             ActionButton("Play",94,649,280,()=>Go(Menu.Modes),true);
@@ -233,7 +277,7 @@ namespace PotionPanic
         {
             MenuHeading("BEHIND THE COUNTER","Credits","Potion Panic - a single-player potion shop game.");
             Label(page,string.IsNullOrWhiteSpace(creatorName)?"A game design class project": "Created by "+creatorName,94,327,1250,48,30,Gold,true);
-            Label(page,"CONCEPT\nBased on the Potion Panic game proposal.\n\nART & AUDIO\nPotion bottles, shop decorations and sound effects are generated in the project.\n\nTOOLS\nBuilt with Unity. Menus use Unity UI (uGUI); the font is supplied by Unity.",94,405,1220,300,22,Ink);
+            Label(page,"CONCEPT\nBased on the Potion Panic game proposal.\n\nMUSIC\nTabletop Jazz Cafe - LudoLoon Studio\nForest - Casual & Relaxing Game Music pack\nAfternoon - Redsen Game Music\nSound effects - HintsStarsLite\n\nART & TOOLS\nProcedural shop art. Built with Unity and Unity UI (uGUI).",94,405,1220,365,20,Ink);
             ActionButton("Back to start",94,779,320,()=>Go(Menu.Start),true);
         }
         void OptionsMenu()
@@ -264,7 +308,7 @@ namespace PotionPanic
             ActionButton("Options",94,411,600,OpenOptions);
             ActionButton("Restart shift",94,487,600,()=>Begin(game.Practice));
             ActionButton("Return to start",94,563,600,()=>{game=null;selected=null;Go(Menu.Start);});
-            Cauldron(page,927,422,Liquids[1]);
+            Cauldron(page,927,422,Liquids[1],false);
         }
         void ShopHeader()
         {
@@ -301,8 +345,7 @@ namespace PotionPanic
                 if(order.Phase==Phase.Served) continue;
                 float x=60+(n%3)*330,y=366+(n/3)*171; n++;
                 Panel(page,"Customer "+order.Number,x,y,310,154,C("3B3147"));
-                Circle(page,x+13,y+17,72,72,order.Number%3==0?Green:C("DEC0A2"));
-                Label(page,order.Number%3==0?"G":order.Number%3==1?"W":"K",x+34,y+31,45,42,31,C("302536"),true);
+                Portrait(page,x+12,y+13,(order.Number-1)%3,.68f);
                 Label(page,order.Customer,x+98,y+19,205,48,20,Ink,true);
                 Label(page,order.Phase==Phase.Waiting?"Ready to order":"Ticket #"+order.Number,x+98,y+72,205,28,16,Muted);
                 ActionButton(order.Phase==Phase.Waiting?"Take order":"View ticket",x+13,y+99,284,()=>{if(order.Phase==Phase.Waiting)game.Take(order);Select(order);},order.Phase==Phase.Waiting,()=>order.Phase!=Phase.Waiting||game.ActiveCount<3);
@@ -326,14 +369,15 @@ namespace PotionPanic
             }
             pourButton=ActionButton("Hold to pour "+PotionGame.Ingredients[ingredient].ToLower(),60,618,422,null,true).gameObject.AddComponent<PotionHoldButton>();
             ActionButton("Empty mixture",502,618,198,()=>{game.Clear(selected);Feedback("Mixture emptied. Try another pour.");});
-            ActionButton("Send to brewing",752,649,280,()=>{game.Prepare(selected);Go(Menu.Brewing);},true);
+            ActionButton("Send to brewing",752,649,280,()=>{if(game.Prepare(selected)){PlayEffect(sounds.startBrewing);Go(Menu.Brewing);}},true);
         }
         void BrewingMenu()
         {
             Heading("THE CAULDRON ROOM","Good things take just enough time.","Stop the brew at 8-10 seconds. Then hold Stir to 70, release, and finish. Two cauldrons are available.");
             if(NeedOrder())return;
             if(selected.Phase!=Phase.ReadyToBrew&&selected.Phase!=Phase.Brewing&&selected.Phase!=Phase.Stirring){WrongStation();return;}
-            Cauldron(page,145,438,Liquids[selected.Recipe]);
+            var bubbles=Cauldron(page,145,438,Liquids[selected.Recipe],selected.Phase==Phase.Brewing);
+            live.Add(()=>bubbles.SetMotion(selected.Phase==Phase.Brewing||(stirButton!=null&&stirButton.Held)));
             Label(page,"TICKET #"+selected.Number+" / "+PotionGame.Recipes[selected.Recipe],105,689,440,35,18,Gold,true);
             Dynamic(()=>PhaseText(selected),566,383,466,48,29,Gold);
             if(selected.Phase==Phase.ReadyToBrew)
@@ -355,7 +399,7 @@ namespace PotionPanic
                 Gauge(()=>selected.StirAmount,566,548,461,Liquids[selected.Recipe],70,3);
                 Dynamic(()=>$"Stirring: {selected.StirAmount:0} / 70",566,589,461,31,18);
                 stirButton=ActionButton("Hold to stir",566,638,276,null,true).gameObject.AddComponent<PotionHoldButton>();
-                ActionButton("Finish",859,638,168,()=>{game.FinishStir(selected);Go(Menu.Finishing);},true);
+                ActionButton("Finish",859,638,168,()=>{if(game.FinishStir(selected)){PlayEffect(sounds.finishBrewing);Go(Menu.Finishing);}},true);
             }
         }
         void FinishingMenu()
@@ -364,7 +408,7 @@ namespace PotionPanic
             if(NeedOrder())return;
             if(selected.Phase!=Phase.Finishing){WrongStation();return;}
             Bottle(page,149,435,1.6f,Mathf.Max(0,selected.ChosenBottle),Liquids[selected.Recipe]);
-            if(selected.ChosenGarnish>=0)Label(page,selected.ChosenGarnish==0?"*":"leaf",273,443,100,50,28,selected.ChosenGarnish==0?Gold:Green,true);
+            if(selected.ChosenGarnish>=0)Garnish(page,273,443,selected.ChosenGarnish);
             Label(page,"BOTTLE",412,375,600,30,16,Gold,true);
             for(int i=0;i<2;i++){int choice=i;ActionButton(PotionGame.Bottles[i],412+i*307,416,289,()=>{selected.ChosenBottle=choice;Render();},selected.ChosenBottle==i);}
             Label(page,"GARNISH",412,491,600,30,16,Gold,true);
@@ -376,7 +420,7 @@ namespace PotionPanic
             ActionButton("Serve potion",753,653,255,()=>
             {
                 if(!game.Serve(selected,matchingTicket)){Feedback("Choose the ticket that matches this potion's number.");return;}
-                Feedback($"{selected.Customer}: {selected.Overall:0}% / +{selected.Payment+selected.Tip} coins");
+                lastMessage=$"{selected.Customer}: {selected.Overall:0}% / +{selected.Payment+selected.Tip} coins"; messageUntil=Time.unscaledTime+5; PlayEffect(sounds.orderComplete);
                 selected=null;Go(game.Complete?Menu.Results:Menu.Orders);
             },true,()=>selected.ChosenBottle>=0&&selected.ChosenGarnish>=0&&matchingTicket>0);
         }
